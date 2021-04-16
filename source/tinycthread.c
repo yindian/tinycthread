@@ -472,6 +472,50 @@ int cnd_timedwait(cnd_t *cond, mtx_t *mtx, const struct timespec *ts)
 }
 
 #if defined(_TTHREAD_WIN32_)
+typedef struct _CLIENT_ID {
+    DWORD UniqueProcess;
+    DWORD UniqueThread;
+} CLIENT_ID;
+
+typedef LONG NTSTATUS;
+#define STATUS_SUCCESS ((NTSTATUS) 0x00000000)
+
+typedef LONG KPRIORITY;
+
+typedef struct _THREAD_BASIC_INFORMATION {
+    NTSTATUS   ExitStatus;
+    PVOID      TebBaseAddress;
+    CLIENT_ID  ClientId;
+    KAFFINITY  AffinityMask;
+    KPRIORITY  Priority;
+    KPRIORITY  BasePriority;
+} THREAD_BASIC_INFORMATION;
+
+typedef enum _THREAD_INFORMATION_CLASS {
+    ThreadBasicInformation = 0,
+} THREAD_INFORMATION_CLASS;
+
+typedef NTSTATUS (__stdcall *pfnNtQueryInformationThread) (HANDLE, THREAD_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+static pfnNtQueryInformationThread s_fnNtQueryInformationThread = NULL;
+
+static DWORD WINAPI thrd_get_tid(thrd_t thr)
+{
+	if (s_fnNtQueryInformationThread)
+	{
+		THREAD_BASIC_INFORMATION tbi;
+		if (s_fnNtQueryInformationThread(thr, ThreadBasicInformation, &tbi, sizeof(tbi), NULL) == STATUS_SUCCESS)
+		{
+			return tbi.ClientId.UniqueThread;
+		}
+	}
+	return (DWORD) thr;
+}
+
+typedef DWORD (WINAPI *LPFN_GetThreadId)(HANDLE);
+static LPFN_GetThreadId s_fnGetThreadId = NULL;
+#endif
+
+#if defined(_TTHREAD_WIN32_)
 struct TinyCThreadTSSData {
   void* value;
   tss_t key;
@@ -537,7 +581,7 @@ static void NTAPI _tinycthread_tss_callback(PVOID h, DWORD dwReason, PVOID pv)
     #pragma data_seg(".CRT$XLB")
   #endif
   PIMAGE_TLS_CALLBACK p_thread_callback = _tinycthread_tss_callback;
-  #ifdef _M_X64
+  #if 1// def _M_X64
     #pragma data_seg()
   #else
     #pragma const_seg()
@@ -642,7 +686,19 @@ int thrd_detach(thrd_t thr)
 int thrd_equal(thrd_t thr0, thrd_t thr1)
 {
 #if defined(_TTHREAD_WIN32_)
-  return GetThreadId(thr0) == GetThreadId(thr1);
+  if (s_fnGetThreadId == NULL)
+  {
+	  HMODULE hModule = GetModuleHandleA("kernel32");
+	  s_fnGetThreadId = (LPFN_GetThreadId) GetProcAddress(hModule, "GetThreadId");
+	  if (s_fnGetThreadId == NULL) /* on Win XP */
+	  {
+		  hModule = GetModuleHandleA("ntdll");
+		  s_fnNtQueryInformationThread = (pfnNtQueryInformationThread) GetProcAddress(
+				  hModule, "NtQueryInformationThread");
+		  s_fnGetThreadId = thrd_get_tid;
+	  }
+  }
+  return s_fnGetThreadId(thr0) == s_fnGetThreadId(thr1);
 #else
   return pthread_equal(thr0, thr1);
 #endif
